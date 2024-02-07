@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <windows.h>
 #include <time.h>
+#include <tchar.h>
 
 #define MAX_CONFIG_LINE 1024
 #define MAX_PATH_LENGTH 1024
@@ -45,6 +46,11 @@ typedef struct {
     char beforeDate[20];
     char searchWord[100];
 } LogOptions;
+
+typedef struct {
+    char commitId[MAX_PATH];
+    FILETIME creationTime;
+} CommitEntry;
 
 bool fileExists(const char *filename) {
     struct stat buffer;
@@ -160,10 +166,6 @@ bool processAlias(int *argc, char ***argv, const char *configPath) {
             newArgv[newArgc++] = strdup(token);
             token = strtok(NULL, " ");
         }
-
-
-
-
 
         *argv = realloc(*argv, newArgc * sizeof(char*));
         memcpy(*argv, newArgv, newArgc * sizeof(char*));
@@ -288,6 +290,7 @@ bool initializeRepository(const char* repoPath) {
             "shortcuts",
             "logs",
             "CurrentBranch",
+            "HEAD",
 
     };
 
@@ -967,8 +970,20 @@ int countFilesInCommitDir(const char* dirPath) {
     return count;
 }
 
+
+bool isFileEmpty(const char* filename) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        return true;
+    }
+    fseek(file, 0, SEEK_END);
+    long fileSize = ftell(file);
+    fclose(file);
+    return fileSize == 0;
+}
+
 bool commitChanges(const char* message) {
-    if (!fileExists(INDEX_FILE)) {
+    if (!fileExists(INDEX_FILE) || isFileEmpty(INDEX_FILE)) {
         printf("No files staged for commit.\n");
         return false;
     }
@@ -1157,19 +1172,23 @@ void removeShortcut(const char* shortcutName) {
 char* getLastCommitId(const char* branchName) {
     static char lastCommitId[MAX_PATH_LENGTH];
     char headFilePath[MAX_PATH_LENGTH];
+    char tempLine[MAX_PATH_LENGTH];
     snprintf(headFilePath, sizeof(headFilePath), "%s/%s_HEAD", COMMIT_DIR, branchName);
 
     FILE *file = fopen(headFilePath, "r");
     if (file) {
-        if (fgets(lastCommitId, sizeof(lastCommitId), file) != NULL) {
-            fclose(file);
-            lastCommitId[strcspn(lastCommitId, "\n")] = 0;
-            return lastCommitId;
+        while (fgets(tempLine, sizeof(tempLine), file) != NULL) {
+            strncpy(lastCommitId, tempLine, sizeof(lastCommitId));
+            lastCommitId[sizeof(lastCommitId) - 1] = '\0';
         }
         fclose(file);
+
+        lastCommitId[strcspn(lastCommitId, "\n")] = 0;
+        return lastCommitId;
     }
     return NULL;
 }
+
 
 void updateCurrentBranch(const char* branchName) {
     FILE *file = fopen(CURRENT_BRANCH_FILE, "w");
@@ -1185,7 +1204,6 @@ void createBranch(const char* branchName) {
     char branchHeadFilePath[MAX_PATH_LENGTH];
     snprintf(branchHeadFilePath, sizeof(branchHeadFilePath), "%s/%s_HEAD", COMMIT_DIR, branchName);
 
-
     if (fileExists(branchHeadFilePath)) {
         printf("Error: Branch '%s' already exists.\n", branchName);
         return;
@@ -1199,11 +1217,20 @@ void createBranch(const char* branchName) {
 
     FILE* branchHeadFile = fopen(branchHeadFilePath, "w");
     if (branchHeadFile) {
-        fprintf(branchHeadFile, "%s", currentCommitId);
+        fprintf(branchHeadFile, "%s\n", currentCommitId);
         fclose(branchHeadFile);
-        printf("Branch '%s' created from the latest commit.\n", branchName);
 
+        char headFilePath[MAX_PATH_LENGTH];
+        snprintf(headFilePath, sizeof(headFilePath), ".zengit/HEAD");
+        FILE* headFile = fopen(headFilePath, "a");
+        if (headFile) {
+            fprintf(headFile, "%s\n", branchName);
+            fclose(headFile);
+        } else {
+            perror("Failed to record branch name in .zengit/HEAD file");
+        }
 
+        printf("Branch '%s' created from the latest commit and recorded in .zengit/HEAD.\n", branchName);
         updateCurrentBranch(branchName);
     } else {
         perror("Failed to create branch HEAD file");
@@ -1495,34 +1522,47 @@ void displayCommitsByAuthor(const LogEntry* entries, int count, const char* auth
     }
 }
 
-time_t dateStringToTimeT(const char* dateString) {
+time_t logDateStringToTimeT(const char* logDateString) {
     struct tm tm = {0};
-    int year, month, day;
+    char monthStr[4];
+    int month, day, hour, minute, second, year;
+    const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
 
+    sscanf(logDateString, "%*s %3s %d %d:%d:%d %d", monthStr, &day, &hour, &minute, &second, &year);
 
-    sscanf(dateString, "%d-%d-%d", &year, &month, &day);
+    month = (strstr(months, monthStr) - months) / 3;
 
-
-    tm.tm_year = year - 1900;
-    tm.tm_mon = month - 1;
+    tm.tm_mon = month;
     tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_year = year - 1900;
+    tm.tm_isdst = -1;
 
+    return mktime(&tm);
+}
 
+time_t cutoffDateToTimeT(const char* dateString) {
+    struct tm tm = {0};
+    sscanf(dateString, "%d-%d-%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday);
+
+    tm.tm_year -= 1900; // Adjust for tm structure's year (years since 1900)
+    tm.tm_mon -= 1; // Adjust month from 1-12 to 0-11
     tm.tm_hour = 0;
     tm.tm_min = 0;
     tm.tm_sec = 0;
-    tm.tm_isdst = -1;
-
+    tm.tm_isdst = -1; // Not considering DST
 
     return mktime(&tm);
 }
 
 void displayCommitsBefore(const LogEntry* entries, int count, const char* date) {
-    time_t cutoffDate = dateStringToTimeT(date);
+    time_t cutoffDate = cutoffDateToTimeT(date);
     printf("Commits before: %s\n", date);
     int found = 0;
     for (int i = count - 1; i >= 0; --i) {
-        time_t commitDate = dateStringToTimeT(entries[i].date);
+        time_t commitDate = logDateStringToTimeT(entries[i].date);
         if (commitDate < cutoffDate) {
             displayLogEntry(&entries[i]);
             found = 1;
@@ -1534,11 +1574,11 @@ void displayCommitsBefore(const LogEntry* entries, int count, const char* date) 
 }
 
 void displayCommitsSince(const LogEntry* entries, int count, const char* date) {
-    time_t cutoffDate = dateStringToTimeT(date);
+    time_t cutoffDate = cutoffDateToTimeT(date);
     printf("Commits since: %s\n", date);
     int found = 0;
     for (int i = count - 1; i >= 0; --i) {
-        time_t commitDate = dateStringToTimeT(entries[i].date);
+        time_t commitDate = logDateStringToTimeT(entries[i].date);
         if (commitDate >= cutoffDate) {
             displayLogEntry(&entries[i]);
             found = 1;
@@ -1584,783 +1624,518 @@ void printLogEntryStartingAtCurrentLine(FILE* logFile) {
     }
 }
 
+int messageContainsTerms(const char* message, const char* terms[], int numTerms) {
+    for (int i = 0; i < numTerms; i++) {
+        if (strstr(message, terms[i]) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int readLogEntry(FILE* file, LogEntry* entry) {
+    if (fscanf(file, "Date: %[^\n]\nUser: %[^\n]\nCommit ID: %[^\n]\nBranch: %[^\n]\nMessage: %[^\n]\nFiles Committed: %d\n\n",
+               entry->date, entry->user, entry->commitID, entry->branch, entry->message, &entry->filesCommitted) == 6) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
 void zengitLogSearch(const char *searchString) {
+    char* terms[256];
+    int numTerms = 0;
+    char* searchStringCopy = strdup(searchString);
+    char* token = strtok(searchStringCopy, " ");
+
+    while (token != NULL && numTerms < 256) {
+        terms[numTerms++] = token;
+        token = strtok(NULL, " ");
+    }
+
     FILE *logFile = fopen(".zengit/logs", "r");
     if (!logFile) {
         printf("Log file not found.\n");
+        free(searchStringCopy);
         return;
     }
 
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), logFile)) {
-
-        if (strstr(buffer, "Message: ")) {
-            char *message = buffer + strlen("Message: ");
-            message[strcspn(message, "\n")] = '\0';
-
-
-            char *token = strtok(searchString, " ");
-            while (token) {
-                if (match(token, message)) {
-
-                    printLogEntryStartingAtCurrentLine(logFile);
-                    break;
-                }
-                token = strtok(NULL, " ");
-            }
+    LogEntry entry;
+    while (readLogEntry(logFile, &entry)) {
+        if (messageContainsTerms(entry.message, terms, numTerms)) {
+            displayLogEntry(&entry);
         }
     }
 
     fclose(logFile);
+    free(searchStringCopy);
 }
 
-bool branchExists(const char* branchName) {
+void deleteDirectoryRecursively(const TCHAR* path) {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    TCHAR dirPathWildcard[MAX_PATH];
+
+    _stprintf_s(dirPathWildcard, MAX_PATH, TEXT("%s\\*"), path); // Append wildcard to search pattern
+    hFind = FindFirstFile(dirPathWildcard, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (_tcscmp(findFileData.cFileName, TEXT(".")) == 0 || _tcscmp(findFileData.cFileName, TEXT("..")) == 0) {
+            continue;
+        }
+
+        TCHAR fullPath[MAX_PATH];
+        _stprintf_s(fullPath, MAX_PATH, TEXT("%s\\%s"), path, findFileData.cFileName);
+
+        if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            deleteDirectoryRecursively(fullPath);
+            RemoveDirectory(fullPath);
+        } else {
+            DeleteFile(fullPath);
+        }
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+}
+
+void clearWorkingDirectoryExceptZengit(const char* dirPath) {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    TCHAR dirPathWildcard[MAX_PATH];
+    _stprintf_s(dirPathWildcard, MAX_PATH, TEXT("%s\\*"), dirPath);
+
+    hFind = FindFirstFile(dirPathWildcard, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        printf("Unable to open directory for clearing: %s\n", dirPath);
+        return;
+    }
+
+    do {
+
+        if (_tcscmp(findFileData.cFileName, TEXT(".")) == 0 || _tcscmp(findFileData.cFileName, TEXT("..")) == 0) {
+            continue;
+        }
+
+        TCHAR fullPath[MAX_PATH];
+        _stprintf_s(fullPath, MAX_PATH, TEXT("%s\\%s"), dirPath, findFileData.cFileName);
+
+        if (_tcscmp(findFileData.cFileName, TEXT(".zengit")) == 0) {
+            continue;
+        }
+
+        if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            deleteDirectoryRecursively(fullPath);
+            RemoveDirectory(fullPath);
+        } else {
+            DeleteFile(fullPath);
+        }
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+}
+
+void zengitCheckout(const char* branchName) {
+    char* lastCommitId = getLastCommitId(branchName);
+    if (lastCommitId == NULL) {
+        printf("Error: Could not find the last commit for branch '%s'.\n", branchName);
+        return;
+    }
+
+    clearWorkingDirectoryExceptZengit(".");
+
+    char commitDirPath[MAX_PATH_LENGTH];
+    snprintf(commitDirPath, sizeof(commitDirPath), ".zengit/commits/%s", lastCommitId);
+    copyDirectoryRecursively(commitDirPath, ".");
+
+    printf("Switched to branch '%s'.\n", branchName);
+}
+
+int commitIdExists(const char* commitId) {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    char dirPath[MAX_PATH];
+    snprintf(dirPath, sizeof(dirPath), ".zengit/commits/%s", commitId);
+
+    hFind = FindFirstFile(dirPath, &findFileData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        FindClose(hFind);
+        return (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    return 0;
+}
+
+void zengitCheckoutCommitId(const char* commitId) {
+    if (!commitIdExists(commitId)) {
+        printf("Error: Commit ID '%s' does not exist.\n", commitId);
+        return;
+    }
+
+    clearWorkingDirectoryExceptZengit(".");
+
+    char commitDirPath[MAX_PATH];
+    snprintf(commitDirPath, sizeof(commitDirPath), ".zengit/commits/%s", commitId);
+
+    copyDirectoryRecursively(commitDirPath, ".");
+
+    printf("Checked out commit '%s'.\n", commitId);
+}
+
+void zengitCheckoutHead() {
+    char* currentBranch = getCurrentBranch();
+    zengitCheckout(currentBranch);
+}
+
+int compareCommitEntries(const void* a, const void* b) {
+    FILETIME* timeA = &((CommitEntry*)a)->creationTime;
+    FILETIME* timeB = &((CommitEntry*)b)->creationTime;
+
+    return CompareFileTime(timeB, timeA);
+}
+
+CommitEntry* getSortedCommits(const char* commitDirPath, int* count) {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    char searchPath[MAX_PATH];
+    snprintf(searchPath, sizeof(searchPath), "%s/*", commitDirPath);
+
+    int capacity = 10;
+    *count = 0;
+    CommitEntry* commits = malloc(capacity * sizeof(CommitEntry));
+    if (!commits) return NULL;
+
+    hFind = FindFirstFile(searchPath, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        free(commits);
+        return NULL;
+    }
+
+    do {
+        if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) continue;
+
+        if (*count >= capacity) {
+            capacity *= 2;
+            CommitEntry* resized = realloc(commits, capacity * sizeof(CommitEntry));
+            if (!resized) {
+                free(commits);
+                FindClose(hFind);
+                return NULL;
+            }
+            commits = resized;
+        }
+
+        snprintf(commits[*count].commitId, MAX_PATH, "%s", findFileData.cFileName);
+        commits[*count].creationTime = findFileData.ftCreationTime;
+        (*count)++;
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+
+    qsort(commits, *count, sizeof(CommitEntry), compareCommitEntries);
+
+    return commits;
+}
+
+void zengitCheckoutHeadN(const char* commitsDir, int n) {
+    int count = 0;
+    CommitEntry* commits = getSortedCommits(commitsDir, &count);
+
+    int targetIndex = n;
+
+    if (!commits || count <= targetIndex) {
+        printf("Error: Unable to find the specified commit. Only %d commits available.\n", count);
+        free(commits);
+        return;
+    }
+
+    zengitCheckoutCommitId(commits[targetIndex].commitId);
+    free(commits);
+}
+
+
+
+
+int isBranchName(const char* branchName) {
     char branchHeadFilePath[MAX_PATH_LENGTH];
     snprintf(branchHeadFilePath, sizeof(branchHeadFilePath), "%s/%s_HEAD", COMMIT_DIR, branchName);
 
-    struct stat buffer;
-    return (stat(branchHeadFilePath, &buffer) == 0);
-}
-
-bool checkDirectoryForUncommittedChanges(const char* dirPath, const char* commitDirPath) {
-    DIR* dir = opendir(dirPath);
-    if (!dir) {
-        fprintf(stderr, "Error opening directory: %s\n", dirPath);
-        return false;
-    }
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-        char filePath[MAX_PATH_LENGTH];
-        snprintf(filePath, sizeof(filePath), "%s/%s", dirPath, entry->d_name);
-
-        char commitFilePath[MAX_PATH_LENGTH];
-        snprintf(commitFilePath, sizeof(commitFilePath), "%s/%s", commitDirPath, entry->d_name);
-
-
-        if (fileExists(filePath) && fileExists(commitFilePath) && filesAreDifferent(filePath, commitFilePath)) {
-            closedir(dir);
-            return true;
-        }
-    }
-
-    closedir(dir);
-    return false;
-}
-
-void deletedirectorycontents(char *dir_path) {
-    DIR *dir = opendir(dir_path);
-    if (!dir) {
-        fprintf(stderr, "Failed to open directory for deletion: %s\n", dir_path);
-        return;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 || strcmp(entry->d_name, ".neogit") == 0) {
-            continue;
-        }
-
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
-
-        struct stat path_stat;
-        stat(path, &path_stat);
-        if (S_ISDIR(path_stat.st_mode)) {
-
-            deletedirectorycontents(path);
-            rmdir(path);
-        } else {
-            remove(path);
-        }
-    }
-
-    closedir(dir);
-}
-
-void copydirectoryrecursively(char *src_dir, char *dest_dir) {
-    DIR *dir = opendir(src_dir);
-    if (!dir) {
-        fprintf(stderr, "Failed to open directory: %s\n", src_dir);
-        return;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 || strcmp(entry->d_name, ".neogit") == 0) {
-
-            continue;
-        }
-
-        char src_path[1024], dest_path[1024];
-        snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, entry->d_name);
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, entry->d_name);
-
-        struct stat path_stat;
-        stat(src_path, &path_stat);
-
-        if (S_ISDIR(path_stat.st_mode)) {
-            mkdir(dest_path);
-            copydirectoryrecursively(src_path, dest_path);
-        } else {
-
-            FILE *src_file = fopen(src_path, "rb"), *dest_file = fopen(dest_path, "wb");
-            if (src_file && dest_file) {
-                char buffer[1024];
-                size_t bytes;
-                while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
-                    fwrite(buffer, 1, bytes, dest_file);
-                }
-                fclose(src_file);
-                fclose(dest_file);
-            } else {
-                if (src_file) fclose(src_file);
-                if (dest_file) fclose(dest_file);
-            }
-        }
-    }
-
-    closedir(dir);
-}
-
-
-
-void copyFromLastCommit(const char* commitID) {
-    char srcDir[MAX_PATH_LENGTH];
-    snprintf(srcDir, sizeof(srcDir), ".zengit/commits/%s", commitID);
-    char destDir[] = ".";
-
-
-    deletedirectorycontents(destDir);
-    copydirectoryrecursively(srcDir, destDir);
-}
-
-void clearWorkingDirectoryExceptZengit() {
-    char workingDir[] = ".";
-    deletedirectorycontents(workingDir);
-}
-
-void updateCurrentBranchName(const char* branchName) {
-    char currentBranchPath[1024];
-    snprintf(currentBranchPath, sizeof(currentBranchPath), ".zengit/CurrentBranch");
-    FILE* file = fopen(currentBranchPath, "w");
-    if (!file) {
-        fprintf(stderr, "Error updating current branch name.\n");
-        return;
-    }
-    fprintf(file, "%s", branchName);
-    fclose(file);
-}
-
-void updateBranchHeadWithCommit(const char* branchName, const char* commitID) {
-    char branchHeadFilePath[1024];
-    snprintf(branchHeadFilePath, sizeof(branchHeadFilePath), ".zengit/commits/%s_HEAD", branchName);
-
-    FILE* file = fopen(branchHeadFilePath, "a");
-    if (!file) {
-        fprintf(stderr, "Error opening %s_HEAD for update.\n", branchName);
-        return;
-    }
-    fprintf(file, "%s\n", commitID);
-
-
-    fclose(file);
-}
-
-bool getLastCommitIDForBranch(const char* branchName, char* lastCommitID, size_t size) {
-    char headFilePath[1024];
-    snprintf(headFilePath, sizeof(headFilePath), ".zengit/commits/%s_HEAD", branchName);
-    FILE* file = fopen(headFilePath, "r");
-    if (!file) {
-        fprintf(stderr, "Failed to open HEAD file for branch %s.\n", branchName);
-        return false;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), file) != NULL) {
-
-    }
-
-    size_t len = strlen(line);
-    if (len > 0 && line[len - 1] == '\n') {
-        line[len - 1] = '\0';
-    }
-    strncpy(lastCommitID, line, size);
-    fclose(file);
-
-    return true;
-}
-
-bool getCurrentBranchName(char* branchName, size_t size) {
-    FILE* file = fopen(CURRENT_BRANCH_FILE, "r");
-    if (!file) {
-        fprintf(stderr, "Error: Unable to open current branch file.\n");
-        return false;
-    }
-
-    if (!fgets(branchName, size, file)) {
-        fprintf(stderr, "Error: Unable to read current branch name.\n");
-        fclose(file);
-        return false;
-    }
-
-
-    branchName[strcspn(branchName, "\n")] = '\0';
-    fclose(file);
-    return true;
-}
-
-bool getCurrentCommit(char* commitID, size_t size) {
-    char branchName[MAX_PATH_LENGTH];
-    if (!getCurrentBranchName(branchName, sizeof(branchName))) {
-        return false;
-    }
-
-    char headFilePath[MAX_PATH_LENGTH];
-    snprintf(headFilePath, sizeof(headFilePath), "%s/%s_HEAD", COMMIT_DIR, branchName);
-
-    FILE* file = fopen(headFilePath, "r");
-    if (!file) {
-        fprintf(stderr, "Error: Unable to open HEAD file for branch %s.\n", branchName);
-        return false;
-    }
-
-    if (!fgets(commitID, size, file)) {
-        fprintf(stderr, "Error: Unable to read latest commit ID from HEAD file for branch %s.\n", branchName);
-        fclose(file);
-        return false;
-    }
-
-
-    commitID[strcspn(commitID, "\n")] = '\0';
-    fclose(file);
-    return true;
-}
-
-void checkoutToBranch(const char* branchName) {
-    char lastCommitID[256];
-    if (!getLastCommitIDForBranch(branchName, lastCommitID, sizeof(lastCommitID))) {
-        fprintf(stderr, "No commits found for branch '%s'.\n", branchName);
-        return;
-    }
-
-    deletedirectorycontents(".");
-
-    char commitFolderPath[1024];
-    snprintf(commitFolderPath, sizeof(commitFolderPath), ".zengit/commits/%s", lastCommitID);
-    copydirectoryrecursively(commitFolderPath, ".");
-
-
-    updateCurrentBranchName(branchName);
-
-    printf("Checked out to the latest commit %s in branch %s.\n", lastCommitID, branchName);
-}
-
-bool commitExists(const char* commitID) {
-    char commitDirPath[MAX_PATH_LENGTH];
-    snprintf(commitDirPath, sizeof(commitDirPath), ".zengit/commits/%s", commitID);
-    struct stat buffer;
-    return (stat(commitDirPath, &buffer) == 0 && S_ISDIR(buffer.st_mode));
-}
-
-void checkoutToCommit(const char* commitID) {
-    char currentCommitDir[MAX_PATH_LENGTH];
-
-
-    if (getCurrentCommit(commitID, sizeof(commitID))) {
-
-        snprintf(currentCommitDir, sizeof(currentCommitDir), ".zengit/commits/%s", commitID);
-        printf("Current commit directory: %s\n", currentCommitDir);
-    } else {
-        fprintf(stderr, "Failed to get current commit ID.\n");
-    }
-
-
-
-    if (checkDirectoryForUncommittedChanges(".", currentCommitDir)) {
-        fprintf(stderr, "Error: Uncommitted changes present. Please commit or stash your changes before checking out.\n");
-        return;
-    }
-
-    if (!commitExists(commitID)) {
-        fprintf(stderr, "Commit %s does not exist.\n", commitID);
-        return;
-    }
-
-    deletedirectorycontents(".");
-
-    char commitFolderPath[MAX_PATH_LENGTH];
-    snprintf(commitFolderPath, sizeof(commitFolderPath), ".zengit/commits/%s", commitID);
-    copydirectoryrecursively(commitFolderPath, ".");
-
-
-    printf("Checked out to commit %s.\n", commitID);
-}
-
-bool getLatestCommitID(const char* branchName, char* commitID, size_t size) {
-    char filePath[1024];
-    snprintf(filePath, sizeof(filePath), ".zengit/commits/%s_HEAD", branchName);
-
-    FILE* file = fopen(filePath, "r");
-    if (!file) {
-        fprintf(stderr, "Error: Unable to open %s_HEAD.\n", branchName);
-        return false;
-    }
-
-    if (fgets(commitID, size, file) == NULL) {
-        fprintf(stderr, "Error: Unable to read latest commit ID from %s_HEAD.\n", branchName);
-        fclose(file);
-        return false;
-    }
-
-
-    commitID[strcspn(commitID, "\n")] = '\0';
-    fclose(file);
-    return true;
-}
-
-
-void checkout_head() {
-    char currentBranch[256];
-    if (!getCurrentBranchName(currentBranch, sizeof(currentBranch))) {
-        fprintf(stderr, "Error: Unable to get current branch name.\n");
-        return;
-    }
-
-    char latestCommitID[260];
-    if (!getLatestCommitID(currentBranch, latestCommitID, sizeof(latestCommitID))) {
-
-        return;
-    }
-
-
-    char commitDirPath[1024];
-    snprintf(commitDirPath, sizeof(commitDirPath), ".zengit/commits/%s", latestCommitID);
-    if (checkDirectoryForUncommittedChanges(".", commitDirPath)) {
-        fprintf(stderr, "Error: There are uncommitted changes.\n");
-        return;
-    }
-
-    checkoutToCommit(latestCommitID);
-    printf("Checked out to the latest commit (HEAD): %s\n", latestCommitID);
-}
-
-bool isValidCommitID(const char* commitID);
-bool isMergeCommit(const char* commitID);
-char* getCommitMessage(const char* commitID);
-void applyInverseChanges(const char* commitID);
-void saveChangesWithoutCommit(void);
-bool createNewCommit(const char* message, const char* commitID); // Adjusted prototype
-void updateLog(const char* commitID, const char* message);
-void updateHEAD(const char* commitID);
-void generateCommitID(char* commitID, size_t size);
-void copyDirectoryRecursively(const char* srcPath, const char* destPath);
-bool fileExists(const char* path);
-bool getLatestCommitID(const char* branchName, char* commitID, size_t size);
-bool getCurrentBranchName(char* branchName, size_t size);
-void checkoutToCommit(const char* commitID);
-bool checkDirectoryForUncommittedChanges(const char* dirPath, const char* commitDirPath);
-char* getTagFilePath(const char* tagName);
-void writeTagInfo(const char* tagFilePath, const char* commitID, const char* taggerName, const char* message);
-char* getCurrentCommitID(void) {
-    // This function should return the commit ID of the current HEAD.
-    // The implementation will depend on how you're tracking the HEAD in your system.
-    static char currentCommitID[41] = "current_head_commit_id"; // Example ID
-    return currentCommitID;
-}
-
-/* void revertChanges(const char* commitID, bool createCommit, const char* customMessage) {
-    if (!isValidCommitID(commitID)) {
-        fprintf(stderr, "Error: Invalid commit ID.\n");
-        return;
-    }
-
-    applyInverseChanges(commitID); // Assuming this function applies the inverse of the changes made by commitID
-
-    if (createCommit) {
-        char message[256];
-        if (customMessage != NULL) {
-            strncpy(message, customMessage, sizeof(message));
-        } else {
-            char* commitMessage = getCommitMessage(commitID);
-            if (commitMessage != NULL) {
-                snprintf(message, sizeof(message), "Revert: %s", commitMessage);
-            } else {
-                strncpy(message, "Revert commit", sizeof(message));
-            }
-        }
-        char newCommitID[41];
-        generateCommitID(newCommitID, sizeof(newCommitID)); // Assuming this generates a new commit ID
-        if (!createNewCommit(message, newCommitID)) {
-            fprintf(stderr, "Error: Failed to create new commit.\n");
-        }
-    } else {
-        saveChangesWithoutCommit(); // Assuming this function stages changes without committing
-    }
-}
-
-bool createCommitDirectory(const char* path) {
-    char tempPath[MAX_PATH_LENGTH];
-    strcpy(tempPath, path);
-    bool success = true;
-
-    for (char* p = tempPath + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') {
-            *p = '\0';
-#ifdef _WIN32
-            if (_mkdir(tempPath) != 0 && errno != EEXIST) success = false;
-#else
-            if (mkdir(tempPath, 0755) != 0 && errno != EEXIST) success = false;
-#endif
-            *p = '/';
-        }
-    }
-
-#ifdef _WIN32
-    if (_mkdir(tempPath) != 0 && errno != EEXIST) success = false;
-#else
-    if (mkdir(tempPath, 0755) != 0 && errno != EEXIST) success = false;
-#endif
-    return success;
-}
-
-bool createNewCommit(const char* message, const char* commitID) {
-    char commitDirPath[1024];
-    snprintf(commitDirPath, sizeof(commitDirPath), ".zengit/commits/%s", commitID);
-    if (!createCommitDirectory(commitDirPath)) {
-        fprintf(stderr, "Failed to create commit directory for commit %s\n", commitID);
-        return false;
-    }
-
-    copyDirectoryRecursively(".", commitDirPath);
-
-    char messageFilePath[1024];
-    snprintf(messageFilePath, sizeof(messageFilePath), "%s/message", commitDirPath);
-    FILE* messageFile = fopen(messageFilePath, "w");
-    if (!messageFile) {
-        fprintf(stderr, "Failed to write commit message for commit %s\n", commitID);
-        return false;
-    }
-    fprintf(messageFile, "%s", message);
-    fclose(messageFile);
-
-    updateLog(commitID, message);
-    updateHEAD(commitID);
-
-    return true;
-}
-
-bool revertCommand(int argc, char* argv[]) {
-    char commitID[41] = {0};
-    char* customMessage = NULL;
-    bool createCommit = true;  // Default to true, change to false if -n flag is used
-
-    if (argc < 3) {
-        fprintf(stderr, "Usage: zengit revert [-m <message>] <commit-id>\n");
-        return false;
-    }
-
-    int i = 1;
-    if (strcmp(argv[i], "-m") == 0) {
-        if (argc < 5) {
-            fprintf(stderr, "Error: Missing commit ID or message.\n");
-            return false;
-        }
-        customMessage = argv[i + 1];
-        strncpy(commitID, argv[i + 2], sizeof(commitID) - 1);
-        commitID[sizeof(commitID) - 1] = '\0';  // Ensure null-termination
-        i += 2;  // Skip past the message and commit ID arguments
-    } else {
-        strncpy(commitID, argv[i], sizeof(commitID) - 1);
-        commitID[sizeof(commitID) - 1] = '\0';  // Ensure null-termination
-        i++;  // Skip past the commit ID argument
-    }
-
-    // Check for -n flag in remaining arguments
-    for (; i < argc; i++) {
-        if (strcmp(argv[i], "-n") == 0) {
-            createCommit = false;
-        }
-    }
-
-    if (!isValidCommitID(commitID)) {
-        fprintf(stderr, "Error: Invalid commit ID.\n");
-        return false;
-    }
-
-    if (isMergeCommit(commitID)) {
-        fprintf(stderr, "Error: Reverting merge commits is not supported.\n");
-        return false;
-    }
-
-    revertChanges(commitID, createCommit, customMessage);  // Call with all required arguments
-
-    if (createCommit) {
-        char* message = customMessage ? customMessage : getCommitMessage(commitID);
-        if (message && !createNewCommit(message, commitID)) {
-            fprintf(stderr, "Error: Failed to create new commit.\n");
-            return false;
-        }
-    }
-
-    printf("Changes from commit %s have been reverted.\n", commitID);
-    return true;
-}
-
-bool isValidCommitID(const char* commitID) {
-    char commitPath[1024];
-    snprintf(commitPath, sizeof(commitPath), ".zengit/commits/%s", commitID);
-    struct stat statbuf;
-    return (stat(commitPath, &statbuf) == 0 && S_ISDIR(statbuf.st_mode));
-}
-
-bool isMergeCommit(const char* commitID) {
-    return false;
-}
-
-
-char* getCommitMessage(const char* commitID) {
-    static char message[256];
-    char logPath[1024];
-    snprintf(logPath, sizeof(logPath), ".zengit/commits/%s/message", commitID);
-    FILE* file = fopen(logPath, "r");
+    FILE* file = fopen(branchHeadFilePath, "r");
     if (file) {
-        if (fgets(message, sizeof(message), file) != NULL) {
-            fclose(file);
-            message[strcspn(message, "\n")] = '\0';
-            return message;
-        }
         fclose(file);
+        return 1;
     }
-    return "No commit message found";
+
+    return 0;
 }
 
-void updateLog(const char* commitID, const char* message) {
-    char logFilePath[1024];
-    snprintf(logFilePath, sizeof(logFilePath), ".zengit/logs");
+int isCommitId(const char* commitId) {
+    char commitDirPath[MAX_PATH_LENGTH];
+    struct stat statbuf;
+    snprintf(commitDirPath, sizeof(commitDirPath), "%s/%s", COMMIT_DIR, commitId);
 
-    FILE* file = fopen(logFilePath, "a");
-    if (!file) {
-        perror("Failed to open log file for updating");
-        return;
-    }
-
-    time_t now = time(NULL);
-    char* dateString = ctime(&now);
-    dateString[strlen(dateString) - 1] = '\0';
-
-    char authorName[256] = "Author Name";
-
-    fprintf(file, "Commit ID: %s\nAuthor: %s\nDate: %s\nMessage: %s\n\n",
-            commitID, authorName, dateString, message);
-    fclose(file);
-}
-
-void updateHEAD(const char* commitID) {
-    char currentBranchName[256];
-    FILE* currentBranchFile = fopen(".zengit/CurrentBranch", "r");
-    if (!currentBranchFile) {
-        perror("Failed to read CurrentBranch file");
-        return;
-    }
-    fscanf(currentBranchFile, "%s", currentBranchName);
-    fclose(currentBranchFile);
-
-    char branchHeadFilePath[1024];
-    snprintf(branchHeadFilePath, sizeof(branchHeadFilePath), ".zengit/%s_HEAD", currentBranchName);
-
-    FILE* branchHeadFile = fopen(branchHeadFilePath, "a");
-    if (!branchHeadFile) {
-        perror("Failed to update branch HEAD file");
-        return;
-    }
-    fprintf(branchHeadFile, "%s\n", commitID);
-    fclose(branchHeadFile);
-}
-
-
-void handleRevertCommand(int argc, char* argv[]) {
-    char commitID[41] = {0};
-    bool createCommit = true;
-    char* customMessage = NULL;
-
-    // Parse arguments
-    if (argc < 2) {
-        fprintf(stderr, "Usage: zengit revert [-n | -m <message>] <commit-id | HEAD-X>\n");
-        return;
-    }
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-n") == 0) {
-            createCommit = false;
-        } else if (strcmp(argv[i], "-m") == 0) {
-            if (i + 1 < argc) {
-                customMessage = argv[++i];
-            } else {
-                fprintf(stderr, "Error: Message not specified for -m flag.\n");
-                return;
-            }
-        } else if (strncmp(argv[i], "HEAD-", 5) == 0) {
-            // Here you need to define the logic for convertHeadToCommitID or handle it accordingly.
-            // For now, let's assume it's not implemented and return an error.
-            fprintf(stderr, "Error: Handling of 'HEAD-X' is not implemented.\n");
-            return;
-        } else {
-            strncpy(commitID, argv[i], sizeof(commitID) - 1);
-            commitID[sizeof(commitID) - 1] = '\0';
+    if (stat(commitDirPath, &statbuf) == 0) {
+        if (S_ISDIR(statbuf.st_mode)) {
+            return 1;
         }
     }
 
-    revertChanges(commitID, createCommit, customMessage);
+    return 0;
 }
 
-bool tagCommand(int argc, char* argv[]) {
-    char tagName[256] = {0};
-    char message[1024] = {0};
-    char commitID[41] = {0};
-    bool force = false;
+void writePlaceholderToIndex() {
+    const char* indexPath = ".zengit/index";
 
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
-            strncpy(tagName, argv[++i], sizeof(tagName) - 1);
-        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            strncpy(message, argv[++i], sizeof(message) - 1);
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            strncpy(commitID, argv[++i], sizeof(commitID) - 1);
-        } else if (strcmp(argv[i], "-f") == 0) {
-            force = true;
-        }
-    }
-
-    if (tagName[0] == '\0') {
-        fprintf(stderr, "Tag name is required.\n");
-        return false;
-    }
-
-    if (commitID[0] == '\0') {
-        strcpy(commitID, getCurrentCommitID());
-        if (commitID[0] == '\0') {
-            fprintf(stderr, "Failed to determine current commit ID.\n");
-            return false;
-        }
-    }
-
-    char* tagFilePath = getTagFilePath(tagName);
-    if (fileExists(tagFilePath) && !force) {
-        fprintf(stderr, "Tag '%s' already exists. Use -f to force overwrite.\n", tagName);
-        free(tagFilePath);
-        return false;
-    }
-
-    char taggerName[256] = "Default Tagger";
-    writeTagInfo(tagFilePath, commitID, taggerName, message);
-    free(tagFilePath);
-    printf("Tag '%s' created for commit %s.\n", tagName, commitID);
-    return true;
-}
-
-
-
-
-void updateTagFile(const char* tagName, const char* commitID, const char* message, bool force) {
-    //.....
-}
-
-char* getTagFilePath(const char* tagName) {
-    char* path = malloc(MAX_TAG_INFO_SIZE);
-    if (path != NULL) {
-        snprintf(path, MAX_TAG_INFO_SIZE, "%s/%s", TAGS_DIR, tagName);
-    }
-    return path;
-}
-
-void writeTagInfo(const char* tagFilePath, const char* commitID, const char* taggerName, const char* message) {
-    FILE* file = fopen(tagFilePath, "w");
+    FILE* file = fopen(indexPath, "w");
     if (file == NULL) {
-        fprintf(stderr, "Failed to open tag file for writing.\n");
+        perror("Failed to open index file");
         return;
     }
 
-    fprintf(file, "Tag Name: %s\nCommit ID: %s\nTagger: %s\nDate: ", tagFilePath, commitID, taggerName);
-    time_t now = time(NULL);
-    fprintf(file, "%s", ctime(&now));
-    fprintf(file, "Message: %s\n", message);
+    fprintf(file, "aaa\n");
+
     fclose(file);
 }
 
-bool grepInFile(const char* filePath, const char* word, bool includeLineNumber);
-bool grepInCommit(const char* commitID, const char* filePath, const char* word, bool includeLineNumber);
-void printHighlightedWord(const char* line, const char* word, bool includeLineNumber, int lineNumber);
+void zengitRevert(const char* message, const char* commitId) {
+    zengitCheckoutCommitId(commitId);
 
-bool grepCommand(int argc, char* argv[]) {
-    char filePath[256] = {0};
-    char word[256] = {0};
-    char commitID[41] = {0};
-    bool includeLineNumber = false;
+    writePlaceholderToIndex();
 
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            strncpy(filePath, argv[++i], sizeof(filePath) - 1);
-        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            strncpy(word, argv[++i], sizeof(word) - 1);
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            strncpy(commitID, argv[++i], sizeof(commitID) - 1);
-        } else if (strcmp(argv[i], "-n") == 0) {
-            includeLineNumber = true;
-        }
-    }
-
-    if (filePath[0] == '\0' || word[0] == '\0') {
-        fprintf(stderr, "Usage: neogit grep -f <file> -p <word> [-c <commit-id>] [-n]\n");
-        return false;
-    }
-
-    if (commitID[0] != '\0') {
-        return grepInCommit(commitID, filePath, word, includeLineNumber);
+    if (!commitChanges(message)) {
+        printf("Failed to create a new commit with the revert message.\n");
     } else {
-        return grepInFile(filePath, word, includeLineNumber);
+        printf("Reverted to commit %s and created a new commit with message: %s\n", commitId, message);
     }
 }
-
-bool grepInFile(const char* filePath, const char* word, bool includeLineNumber) {
-    FILE* file = fopen(filePath, "r");
+char* findCommitMessage(const char* commitId) {
+    static char message[256];
+    FILE* file = fopen(".zengit/logs", "r");
     if (!file) {
-        perror("Failed to open file");
-        return false;
+        perror("Failed to open log file");
+        return NULL;
     }
 
     char line[1024];
-    int lineNumber = 1;
+    bool isTargetCommit = false;
+
     while (fgets(line, sizeof(line), file)) {
-        if (strstr(line, word)) {
-            printHighlightedWord(line, word, includeLineNumber, lineNumber);
+        if (strstr(line, "Commit ID: ") && strstr(line, commitId)) {
+            isTargetCommit = true;
+        } else if (isTargetCommit && strstr(line, "Message: ")) {
+            sscanf(line, "Message: %[^\n]", message);
+            fclose(file);
+            return message;
+        } else if (line[0] == '\n') {
+            isTargetCommit = false;
         }
-        lineNumber++;
     }
+
     fclose(file);
-    return true;
+    return NULL;
 }
 
-void printHighlightedWord(const char* line, const char* word, bool includeLineNumber, int lineNumber) {
-    if (includeLineNumber) {
-        printf("%d: ", lineNumber);
+void zengitRevertWithoutMessage(const char* commitId) {
+    char* commitMessage = findCommitMessage(commitId);
+    if (!commitMessage) {
+        printf("Error: Could not find commit message for commit ID '%s'.\n", commitId);
+        return;
     }
-    char* match = strstr(line, word);
-    while (match) {
-        fwrite(line, 1, match - line, stdout);
-        printf(ANSI_COLOR_RED "%s" ANSI_COLOR_RESET, word);
-        line = match + strlen(word);
-        match = strstr(line, word);
+
+    zengitCheckoutCommitId(commitId);
+
+    writePlaceholderToIndex();
+
+    if (!commitChanges(commitMessage)) {
+        printf("Failed to create a new commit with the revert message.\n");
+    } else {
+        printf("Reverted to commit %s and created a new commit with message: %s\n", commitId, commitMessage);
     }
-    printf("%s", line);
 }
 
-bool grepInCommit(const char* commitID, const char* filePath, const char* word, bool includeLineNumber) {
-    printf("Searching in commit %s not implemented.\n", commitID);
-    return false;
+void zengitRevertToCommit(const char* commitId) {
+    zengitCheckoutCommitId(commitId);
 }
+
+void zengitRevertToHead() {
+    zengitCheckoutHead();
+}
+
+void zengitRevertHeadXWithMessage(int X, const char* message) {
+    zengitCheckoutHeadN(".zengit/commits", X-1);
+
+    writePlaceholderToIndex();
+
+    if (!commitChanges(message)) {
+        printf("Failed to create a new commit after reverting.\n");
+    } else {
+        printf("Successfully reverted to HEAD-%d and created a new commit with message: %s\n", X, message);
+    }
+}
+
+void createTag(const char* tagName, const char* message, const char* commitId, bool force) {
+    char tagFilePath[256];
+    snprintf(tagFilePath, sizeof(tagFilePath), "%s/%s", TAGS_DIR, tagName);
+
+    struct stat buffer;
+    if (stat(tagFilePath, &buffer) == 0) { // File exists
+        if (!force) {
+            printf("Error: Tag '%s' already exists. Use -f to overwrite.\n", tagName);
+            return;
+        }
+    }
+
+    char lastCommitId[256];
+    if (!commitId) {
+        commitId = getLastCommitId(getCurrentBranch());
+        if (!commitId) {
+            printf("Error: Unable to determine the last commit ID.\n");
+            return;
+        }
+    }
+
+    FILE* file = fopen(tagFilePath, "w");
+    if (!file) {
+        perror("Failed to create or overwrite tag file");
+        return;
+    }
+
+    char userName[256];
+    if (!getUserNameFromConfig(userName, sizeof(userName), "./.zengitconfig") &&
+        !getUserNameFromConfig(userName, sizeof(userName), "C:/Users/parham/.zengitconfig")) {
+        strcpy(userName, "Unknown");
+    }
+
+    time_t now = time(NULL);
+    char formattedTime[64];
+    strftime(formattedTime, sizeof(formattedTime), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    fprintf(file, "Tag Name: %s\nCommit ID: %s\nUser: %s\nDate: %s\nMessage: %s\n",
+            tagName, commitId, userName, formattedTime, message ? message : "");
+
+    fclose(file);
+    printf("Tag '%s' created successfully.\n", tagName);
+}
+
+int compareStrings(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+void listTags() {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    char path[MAX_PATH];
+    snprintf(path, MAX_PATH, "%s/*", TAGS_DIR);
+
+    char** tags = malloc(sizeof(char*) * 10);
+    int capacity = 10, n = 0;
+
+    hFind = FindFirstFile(path, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        printf("No tags found.\n");
+        return;
+    }
+
+    do {
+
+        if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+
+            if (n >= capacity) {
+                capacity *= 2;
+                tags = realloc(tags, sizeof(char*) * capacity);
+                if (!tags) {
+                    printf("Memory allocation error.\n");
+                    FindClose(hFind);
+                    return;
+                }
+            }
+
+            tags[n] = malloc(strlen(findFileData.cFileName) + 1);
+            strcpy(tags[n], findFileData.cFileName);
+            n++;
+        }
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+
+    qsort(tags, n, sizeof(char*), compareStrings);
+
+    for (int i = 0; i < n; i++) {
+        printf("%s\n", tags[i]);
+        free(tags[i]);
+    }
+
+    free(tags);
+}
+
+void showTagInfo(const char* tagName) {
+    char tagFilePath[256];
+    snprintf(tagFilePath, sizeof(tagFilePath), "%s/%s", TAGS_DIR, tagName);
+
+    FILE* file = fopen(tagFilePath, "r");
+    if (!file) {
+        printf("Error: Could not find tag '%s'.\n", tagName);
+        return;
+    }
+
+    printf("Information for tag '%s':\n", tagName);
+    char line[1024];
+    while (fgets(line, sizeof(line), file)) {
+        printf("%s", line);
+    }
+
+    fclose(file);
+}
+
+void highlightPattern(const char* line, const char* pattern) {
+    const char* start = line;
+    const char* found = NULL;
+
+    const char* RED = "\x1B[31m";
+    const char* RESET = "\x1B[0m";
+
+    while ((found = strstr(start, pattern)) != NULL) {
+        printf("%.*s", (int)(found - start), start);
+
+        printf("%s%s%s", RED, pattern, RESET);
+
+        start = found + strlen(pattern);
+    }
+
+    printf("%s", start);
+}
+
+void grepInFile(const char* dir, const char* filename, const char* pattern, bool showLineNum) {
+    char fullPath[1024];
+    if (dir) {
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", dir, filename);
+        filename = fullPath;
+    }
+
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        perror("Error opening file");
+        return;
+    }
+
+    char line[1024];
+    int lineNum = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        lineNum++;
+        if (strstr(line, pattern) != NULL) {
+            if (showLineNum) {
+                printf("%d: ", lineNum);
+            }
+            highlightPattern(line, pattern); // Assuming highlightPattern is defined as before
+        }
+    }
+
+    fclose(file);
+}
+
+
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -2478,82 +2253,83 @@ int main(int argc, char *argv[]) {
 
         free(entries);
     } else if (strcmp(argv[1], "checkout") == 0 && argc == 3) {
-        const char *identifier = argv[2];
+        const char *checkoutTarget = argv[2];
 
-        char currentCommitDir[MAX_PATH_LENGTH];
-        char commitID[260];
-
-        if (strcmp(identifier, "HEAD") == 0) {
-            checkout_head();
-        } else if (strncmp(identifier, "HEAD-", 5) == 0) {
-            int n = atoi(identifier + 5);
+        if (strcmp(checkoutTarget, "HEAD") == 0) {
+            zengitCheckoutHead();
+        } else if (strncmp(checkoutTarget, "HEAD-", 5) == 0) {
+            // Extract the number following "HEAD-"
+            int n = atoi(checkoutTarget + 5);
             if (n > 0) {
-
+                zengitCheckoutHeadN(".zengit/commits", n);
             } else {
-                fprintf(stderr, "Error: Invalid number for HEAD-n.\n");
+                printf("Error: Invalid checkout target '%s'.\n", checkoutTarget);
             }
-        } else if (commitExists(identifier)) {
+        } else if (isBranchName(checkoutTarget)) {
+            zengitCheckout(checkoutTarget);
+        } else if (isCommitId(checkoutTarget)) {
+            zengitCheckoutCommitId(checkoutTarget);
+        }
 
-            if (!getCurrentCommit(commitID, sizeof(commitID))) {
-                fprintf(stderr, "Failed to get current commit ID.\n");
-                return 0;
+    } else if (strcmp(argv[1], "revert") == 0 && argc == 5 && strcmp(argv[2], "-m") == 0) {
+        const char* message = argv[3];
+        const char* commitId = argv[4];
+        zengitRevert(message, commitId);
+    }  else if (strcmp(argv[1], "revert") == 0 && argc == 3) {
+        const char* commitId = argv[2];
+        zengitRevertWithoutMessage(commitId);
+    } else if (strcmp(argv[1], "revert") == 0 && argc == 4 && strcmp(argv[2], "-n") == 0) {
+        const char* commitId = argv[3];
+        zengitRevertToCommit(commitId);
+    } else if (strcmp(argv[1], "revert") == 0 && argc == 3 && strcmp(argv[2], "-n") == 0) {
+        zengitRevertToHead();
+    } else if (argc == 2 && strcmp(argv[1], "tag") == 0) {
+        listTags();
+    } if (argc == 4 && strcmp(argv[1], "tag") == 0 && strcmp(argv[2], "show") == 0) {
+        showTagInfo(argv[3]);
+    } else if (strcmp(argv[1], "tag") == 0 && strcmp(argv[2], "-a") == 0 && argc >= 4) {
+        const char* tagName = argv[3];
+        const char* message = NULL;
+        const char* commitId = NULL;
+        bool force = false;
+
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+                message = argv[++i];
+            } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+                commitId = argv[++i];
+            } else if (strcmp(argv[i], "-f") == 0) {
+                force = true;
             }
+        }
+        createTag(tagName, message, commitId, force);
+    }     else if (strcmp(argv[1], "grep") == 0) {
+        char* filename = NULL;
+        char* pattern = NULL;
+        char* commitId = NULL;
+        bool showLineNumbers = false; // Corrected to false as default
+        char basePath[256] = "."; // Default to current directory
 
-
-            snprintf(currentCommitDir, sizeof(currentCommitDir), ".zengit/commits/%s", commitID);
-
-
-            if (checkDirectoryForUncommittedChanges(".", currentCommitDir)) {
-                fprintf(stderr,
-                        "Error: Uncommitted changes present. Please commit or stash your changes before checking out.\n");
-                return 0;
+        // Parse grep-specific options
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+                filename = argv[++i];
+            } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+                pattern = argv[++i];
+            } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+                commitId = argv[++i];
+                // Update basePath to include the commit ID directory
+                snprintf(basePath, sizeof(basePath), ".zengit/commits/%s", commitId);
+            } else if (strcmp(argv[i], "-n") == 0) {
+                showLineNumbers = true; // Only set to true if -n is present
             }
+        }
 
-
-            checkoutToCommit(identifier);
+        if (filename && pattern) {
+            grepInFile(basePath, filename, pattern, showLineNumbers);
         } else {
-            fprintf(stderr, "Error: The specified identifier does not match any commit or branch.\n");
+            printf("Usage: zengit grep -f <file> -p <word> [-c <commit-id>] [-n]\n");
         }
-        return 0;
-    } else if (strcmp(argv[1], "revert") == 0) {
-        if (argc >= 3 && strcmp(argv[2], "-m") == 0) {
-          //  int result = handleRevertCommand(argc, argv) ? 0 : 1;
-        } else if (argc >= 3 && strcmp(argv[2], "-n") == 0) {
-            // return handleRevertWithoutCommit(argc, argv) ? 0 : 1;
-        } else if (argc == 3 && strstr(argv[2], "HEAD-") == argv[2]) {
-          //  return handleRevertToPreviousCommit(argc, argv) ? 0 : 1;
-        } else {
-            fprintf(stderr, "Unknown revert option or missing arguments.\n");
-            return 1;
-        }
-    } else if (strcmp(argv[1], "tag") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Usage: zengit tag -a <tag-name> [-m <message>] [-c <commit-id>] [-f]\n");
-            return 1; // Indicate error
-        }
-
-        if (strcmp(argv[2], "-a") == 0) {
-            // Ensure there's at least a tag name after the "-a" option
-            if (argc >= 4) {
-                if (!tagCommand(argc, argv)) {
-                    fprintf(stderr, "Failed to create tag.\n");
-                    return 1; // Indicate error
-                }
-                return 0; // Indicate success
-            } else {
-                fprintf(stderr, "Tag name is required after '-a'.\n");
-                return 1; // Indicate error
-            }
-        } else {
-            fprintf(stderr, "Missing '-a' option for tag command.\n");
-            return 1; // Indicate error
-        }
-    } else if (strcmp(argv[1], "grep") == 0) {
-        if (!grepCommand(argc, argv)) {
-            fprintf(stderr, "Failed to execute grep command.\n");
-            return 1; // Indicate an error
-        }
-        return 0; // Success
     } else {
         fprintf(stderr, "Unknown command: %s\n", argv[1]);
         return 1;
